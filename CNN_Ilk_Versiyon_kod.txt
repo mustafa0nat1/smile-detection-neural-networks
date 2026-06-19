@@ -1,0 +1,166 @@
+# ─── HÜCRE 1 ───────────────────────────────────────
+# HÜCRE 1: Kütüphaneler ve Veri Kontrolü
+import os
+import zipfile
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import cv2
+from sklearn.model_selection import train_test_split
+
+zip_yolu = "/content/SMILEs.zip"
+if os.path.exists(zip_yolu) and not os.path.exists("/content/SMILEs"):
+    print("SMILEs.zip dosyası bulundu. Klasöre çıkarılıyor...")
+    with zipfile.ZipFile(zip_yolu, 'r') as zip_ref:
+        zip_ref.extractall("/content/")
+    print("Çıkarma işlemi başarıyla tamamlandı!")
+
+# ─── HÜCRE 2 ───────────────────────────────────────
+# HÜCRE 2: Hiperparametreler ve Klasör Yolları
+POZ_YOL = "/content/SMILEs/positives/positives7/"
+NEG_YOL = "/content/SMILEs/negatives/negatives7/"
+
+RESIM_BOYUTU = 64
+BATCH_BOYUTU = 64
+EPOCH_SAYISI = 20
+
+CIHAZ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(42)
+np.random.seed(42)
+
+print(f"Eğitim için kullanılan donanım: {CIHAZ}")
+
+# ─── HÜCRE 3 ───────────────────────────────────────
+# HÜCRE 3: Veri Yükleme ve CNN İçin Hazırlama
+def veri_yukle(poz_yol, neg_yol, boyut):
+    resimler, etiketler = [], []
+    for klasor_yolu, etiket in [(poz_yol, 1), (neg_yol, 0)]:
+        if not os.path.exists(klasor_yolu): continue
+        dosyalar = os.listdir(klasor_yolu)
+        for dosya_adi in dosyalar:
+            if not dosya_adi.lower().endswith('.jpg'): continue
+            try:
+                resim = cv2.imread(os.path.join(klasor_yolu, dosya_adi), cv2.IMREAD_GRAYSCALE)
+                if resim is None: continue
+                resimler.append(cv2.resize(resim, (boyut, boyut)))
+                etiketler.append(etiket)
+            except Exception:
+                continue
+
+    X = np.array(resimler, dtype=np.float32) / 255.0
+    y = np.array(etiketler, dtype=np.float32)
+    return X, y
+
+print("Veri seti klasörlerden yükleniyor...")
+X, y = veri_yukle(POZ_YOL, NEG_YOL, RESIM_BOYUTU)
+print(f"Toplam resim: {len(X)} | Gülümseyen: {int(y.sum())} | Gülümsemeyen: {int(len(y)-y.sum())}")
+
+X_egitim, X_test, y_egitim, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# CNN için boyutlandırma: (Batch, Channel, Height, Width) -> (N, 1, 64, 64)
+X_eg_t = torch.tensor(X_egitim).unsqueeze(1)
+X_te_t = torch.tensor(X_test).unsqueeze(1)
+y_eg_t = torch.tensor(y_egitim).unsqueeze(1)
+y_te_t = torch.tensor(y_test).unsqueeze(1)
+
+eg_yuk = DataLoader(TensorDataset(X_eg_t, y_eg_t), batch_size=BATCH_BOYUTU, shuffle=True)
+te_yuk = DataLoader(TensorDataset(X_te_t, y_te_t), batch_size=BATCH_BOYUTU, shuffle=False)
+
+# ─── HÜCRE 4 ───────────────────────────────────────
+# HÜCRE 4: Model Mimarisi - İlk Versiyon (Sığ Ağ)
+class CNN_Ilk(nn.Module):
+    def __init__(self, boyut=64):
+        super().__init__()
+        # 1 giriş kanalı (siyah-beyaz), 8 çıkış kanalı (filtre)
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, padding=1)
+        self.relu  = nn.ReLU()
+        self.pool  = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # MaxPool boyutları yarıya düşürür: 32x32. Filtre sayısı: 8
+        self.fc    = nn.Linear(8 * (boyut//2) * (boyut//2), 1)
+
+    def forward(self, x):
+        x = self.pool(self.relu(self.conv1(x)))    # Çıkış boyutu: (N, 8, 32, 32)
+        x = x.view(x.size(0), -1)                  # Düzleştirme (Flatten)
+        return self.fc(x)
+
+model = CNN_Ilk(RESIM_BOYUTU).to(CIHAZ)
+print("--- Model Özeti (Summary) ---")
+print(model)
+print(f"Toplam eğitilebilir parametre sayısı: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+# ─── HÜCRE 5 ───────────────────────────────────────
+# HÜCRE 5: Derleme (Compile) Adımı
+kayip_fn  = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+print("Model Derleme Bilgileri:")
+print("Loss Fonksiyonu: BCEWithLogitsLoss | Optimizer: Adam (lr=0.001)")
+
+# ─── HÜCRE 6 ───────────────────────────────────────
+# HÜCRE 6: Eğitim Döngüsü (20 Epoch)
+gecmis = {k: [] for k in ["egitim_loss", "test_loss", "egitim_acc", "test_acc"]}
+
+print(f"=== CNN {EPOCH_SAYISI} EPOCH'LUK EĞİTİM BAŞLIYOR ===")
+for epoch in range(EPOCH_SAYISI):
+    model.train()
+    tl, td, tt = 0.0, 0, 0
+    for Xb, yb in eg_yuk:
+        Xb, yb = Xb.to(CIHAZ), yb.to(CIHAZ)
+        optimizer.zero_grad()
+        c = model(Xb)
+        l = kayip_fn(c, yb)
+        l.backward()
+        optimizer.step()
+
+        tl += l.item() * Xb.size(0)
+        td += (torch.sigmoid(c) >= 0.5).float().eq(yb).sum().item()
+        tt += Xb.size(0)
+
+    el, ea = tl/tt, td/tt
+
+    model.eval()
+    vl, vd, vt = 0.0, 0, 0
+    with torch.no_grad():
+        for Xb, yb in te_yuk:
+            Xb, yb = Xb.to(CIHAZ), yb.to(CIHAZ)
+            c = model(Xb)
+            l = kayip_fn(c, yb)
+
+            vl += l.item() * Xb.size(0)
+            vd += (torch.sigmoid(c) >= 0.5).float().eq(yb).sum().item()
+            vt += Xb.size(0)
+
+    tl2, ta = vl/vt, vd/vt
+
+    gecmis["egitim_loss"].append(el)
+    gecmis["test_loss"].append(tl2)
+    gecmis["egitim_acc"].append(ea)
+    gecmis["test_acc"].append(ta)
+
+    print(f"Epoch {epoch+1:2d}/{EPOCH_SAYISI} | Eğt Loss: {el:.4f} Acc: {ea:.4f} | Test Loss: {tl2:.4f} Acc: {ta:.4f}")
+
+# ─── HÜCRE 7 ───────────────────────────────────────
+# HÜCRE 7: Performans Grafiği (Tüm Metrikler Tek Grafikte)
+ep = range(1, EPOCH_SAYISI + 1)
+plt.figure(figsize=(10, 6))
+
+plt.plot(ep, gecmis["egitim_loss"], label="Train Loss", color='red', linestyle='-')
+plt.plot(ep, gecmis["test_loss"], label="Validation Loss", color='orange', linestyle='-')
+plt.plot(ep, gecmis["egitim_acc"], label="Train Accuracy", color='blue', linestyle='--')
+plt.plot(ep, gecmis["test_acc"], label="Validation Accuracy", color='cyan', linestyle='--')
+
+plt.title("CNN İlk Versiyon - Model Performans Analizi")
+plt.xlabel("Epoch")
+plt.ylabel("Değer (Loss / Accuracy)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig("CNN_ilk_versiyon_grafik.png", dpi=150)
+plt.show()
+
+print("\nGrafik başarıyla kaydedildi: CNN_ilk_versiyon_grafik.png")
+print(f"Eğitim Sonu Değerleri -> Eğt Loss: {gecmis['egitim_loss'][-1]:.4f} Eğt Acc: {gecmis['egitim_acc'][-1]:.4f} | Test Loss: {gecmis['test_loss'][-1]:.4f} Test Acc: {gecmis['test_acc'][-1]:.4f}")

@@ -1,0 +1,192 @@
+# ─── HÜCRE 1 ───────────────────────────────────────
+# HÜCRE 1: Gerekli Kütüphaneler ve Zip Dosyasını Çıkarma
+import os
+import zipfile
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import cv2
+from sklearn.model_selection import train_test_split
+
+zip_yolu = "/content/SMILEs.zip"
+
+# Zip dosyasını kontrol edip dışarı çıkarıyoruz
+if os.path.exists(zip_yolu):
+    print("SMILEs.zip dosyası bulundu. Klasöre çıkarılıyor...")
+    with zipfile.ZipFile(zip_yolu, 'r') as zip_ref:
+        zip_ref.extractall("/content/")
+    print("Çıkarma işlemi başarıyla tamamlandı!")
+else:
+    print("HATA: SMILEs.zip dosyası bulunamadı! Lütfen sol taraftaki menüden dosyayı yükleyin.")
+
+# ─── HÜCRE 2 ───────────────────────────────────────
+# HÜCRE 2: Hiperparametreler ve Klasör Yolları
+POZ_YOL    = "/content/SMILEs/positives/positives7/"      # Gülümseyen yüzler klasörü
+NEG_YOL    = "/content/SMILEs/negatives/negatives7/"      # Gülümsemeyen yüzler klasörü
+
+RESIM_BOYUTU = 64
+BATCH_BOYUTU = 64
+EPOCH_SAYISI = 20
+
+# Ekran kartı (GPU) varsa onu kullan, yoksa işlemciye (CPU) geç
+CIHAZ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Sonuçların her seferinde aynı çıkması için
+torch.manual_seed(42)
+np.random.seed(42)
+
+print(f"Eğitim için kullanılan donanım: {CIHAZ}")
+
+# ─── HÜCRE 3 ───────────────────────────────────────
+# HÜCRE 3: Klasörden Veri Yükleme ve Ön İşlemler
+def veri_yukle(poz_yol, neg_yol, boyut):
+    resimler = []
+    etiketler = []
+
+    for klasor_yolu, etiket in [(poz_yol, 1), (neg_yol, 0)]:
+        if not os.path.exists(klasor_yolu):
+            print(f"UYARI: {klasor_yolu} klasörü bulunamadı!")
+            continue
+
+        dosyalar = os.listdir(klasor_yolu)
+        print(f"  {'Gülümseyen' if etiket == 1 else 'Gülümsemeyen'} sınıfı için {len(dosyalar)} resim işleniyor...")
+
+        for dosya_adi in dosyalar:
+            if not dosya_adi.lower().endswith('.jpg'):
+                continue
+
+            dosya_yolu = os.path.join(klasor_yolu, dosya_adi)
+            try:
+                resim = cv2.imread(dosya_yolu, cv2.IMREAD_GRAYSCALE)
+                if resim is None:
+                    continue
+                resim = cv2.resize(resim, (boyut, boyut))
+                resimler.append(resim)
+                etiketler.append(etiket)
+            except Exception:
+                continue
+
+    X = np.array(resimler, dtype=np.float32) / 255.0
+    y = np.array(etiketler, dtype=np.float32)
+    return X, y
+
+print("\nVeri seti klasörlerden yükleniyor...")
+X, y = veri_yukle(POZ_YOL, NEG_YOL, RESIM_BOYUTU)
+print(f"Toplam resim sayısı: {len(X)} | Gülümseyen: {int(y.sum())} | Gülümsemeyen: {int(len(y)-y.sum())}")
+
+# Veriyi %80 eğitim ve %20 test olacak şekilde ayırıyoruz
+X_egitim, X_test, y_egitim, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+print(f"Eğitim seti boyutu: {len(X_egitim)} | Test seti boyutu: {len(X_test)}")
+
+# MLP ağında kullanabilmek için görüntü matrislerini düzleştiriyoruz: (N, 64*64)
+X_egitim_t = torch.tensor(X_egitim.reshape(len(X_egitim), -1))
+X_test_t   = torch.tensor(X_test.reshape(len(X_test), -1))
+y_egitim_t = torch.tensor(y_egitim).unsqueeze(1)
+y_test_t   = torch.tensor(y_test).unsqueeze(1)
+
+egitim_yukleyici = DataLoader(TensorDataset(X_egitim_t, y_egitim_t), batch_size=BATCH_BOYUTU, shuffle=True)
+test_yukleyici   = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=BATCH_BOYUTU, shuffle=False)
+
+giris_boyutu = RESIM_BOYUTU * RESIM_BOYUTU   # 64x64 = 4096 giriş özelliği
+
+# ─── HÜCRE 4 ───────────────────────────────────────
+# HÜCRE 4: Model Mimarisi - İlk Versiyon (Sığ Ağ)
+class MLP_Ilk(nn.Module):
+    def __init__(self, giris):
+        super().__init__()
+        # Soru 2'de istenen basit sığ ağ mimarisi: Tek gizli katman, 8 nöron
+        self.fc1  = nn.Linear(giris, 8)
+        self.relu = nn.ReLU()
+        self.fc2  = nn.Linear(8, 1) # Çıkış katmanı (İki sınıflı classification)
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+model = MLP_Ilk(giris_boyutu).to(CIHAZ)
+print("--- Model Özeti (Summary) ---")
+print(model)
+print(f"Toplam eğitilebilir parametre sayısı: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+# ─── HÜCRE 5 ───────────────────────────────────────
+# HÜCRE 5: Derleme (Compile) Adımı
+# Binary Cross Entropy loss fonksiyonu seçildi çünkü problemimiz iki sınıflı [cite: 20]
+kayip_fn  = nn.BCEWithLogitsLoss()
+# Optimizasyon algoritması olarak standart Adam tercih edildi
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+print("Model Derleme Bilgileri:")
+print("Loss Fonksiyonu: BCEWithLogitsLoss | Optimizer: Adam (lr=0.001)")
+
+# ─── HÜCRE 6 ───────────────────────────────────────
+# HÜCRE 6: Eğitim Döngüsü (20 Epoch) [cite: 33]
+gecmis = {"egitim_loss": [], "test_loss": [], "egitim_acc": [], "test_acc": []}
+
+print(f"=== {EPOCH_SAYISI} EPOCH'LUK EĞİTİM SÜRECİ BAŞLIYOR ===")
+for epoch in range(EPOCH_SAYISI):
+    # Eğitim Adımı
+    model.train()
+    t_loss, t_dogru, t_top = 0.0, 0, 0
+    for Xb, yb in egitim_yukleyici:
+        Xb, yb = Xb.to(CIHAZ), yb.to(CIHAZ)
+        optimizer.zero_grad()
+        cikis = model(Xb)
+        loss  = kayip_fn(cikis, yb)
+        loss.backward()
+        optimizer.step()
+
+        t_loss  += loss.item() * Xb.size(0)
+        t_dogru += (torch.sigmoid(cikis) >= 0.5).float().eq(yb).sum().item()
+        t_top   += Xb.size(0)
+
+    eg_loss = t_loss / t_top
+    eg_acc  = t_dogru / t_top
+
+    # Test/Validation Adımı
+    model.eval()
+    v_loss, v_dogru, v_top = 0.0, 0, 0
+    with torch.no_grad():
+        for Xb, yb in test_yukleyici:
+            Xb, yb = Xb.to(CIHAZ), yb.to(CIHAZ)
+            cikis = model(Xb)
+            loss  = kayip_fn(cikis, yb)
+
+            v_loss  += loss.item() * Xb.size(0)
+            v_dogru += (torch.sigmoid(cikis) >= 0.5).float().eq(yb).sum().item()
+            v_top   += Xb.size(0)
+
+    te_loss = v_loss / v_top
+    te_acc  = v_dogru / v_top
+
+    # İstatistiklerin Kaydedilmesi
+    gecmis["egitim_loss"].append(eg_loss)
+    gecmis["test_loss"].append(te_loss)
+    gecmis["egitim_acc"].append(eg_acc)
+    gecmis["test_acc"].append(te_acc)
+
+    print(f"Epoch {epoch+1:2d}/{EPOCH_SAYISI} | Eğt Loss: {eg_loss:.4f} Acc: {eg_acc:.4f} | Test Loss: {te_loss:.4f} Acc: {te_acc:.4f}")
+
+# ─── HÜCRE 7 ───────────────────────────────────────
+# HÜCRE 7: Performans Grafiği
+# Proje isterine (Not 1) uygun olarak tüm metrikler tek grafikte [cite: 75, 76]
+epochs = range(1, EPOCH_SAYISI + 1)
+plt.figure(figsize=(10, 6))
+
+plt.plot(epochs, gecmis["egitim_loss"], label="Train Loss", color='red', linestyle='-')
+plt.plot(epochs, gecmis["test_loss"], label="Validation Loss", color='orange', linestyle='-')
+plt.plot(epochs, gecmis["egitim_acc"], label="Train Accuracy", color='blue', linestyle='--')
+plt.plot(epochs, gecmis["test_acc"], label="Validation Accuracy", color='cyan', linestyle='--')
+
+plt.title("MLP İlk Versiyon - Model Performans Analizi")
+plt.xlabel("Epoch")
+plt.ylabel("Değer (Loss / Accuracy)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig("MLP_ilk_versiyon_grafik.png", dpi=150)
+plt.show()
+
+print("\nGrafik başarıyla kaydedildi: MLP_ilk_versiyon_grafik.png")
+print(f"Eğitim Sonu Değerleri -> Eğt Loss: {gecmis['egitim_loss'][-1]:.4f} Eğt Acc: {gecmis['egitim_acc'][-1]:.4f} | Test Loss: {gecmis['test_loss'][-1]:.4f} Test Acc: {gecmis['test_acc'][-1]:.4f}")

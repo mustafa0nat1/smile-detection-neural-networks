@@ -1,0 +1,415 @@
+# ─── HÜCRE 1 ───────────────────────────────────────
+# HÜCRE 1: Kütüphaneler ve Veri Seti Kontrolü
+import os
+import zipfile
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import cv2
+from sklearn.model_selection import train_test_split
+
+zip_yolu = "/content/SMILEs.zip"
+if os.path.exists(zip_yolu) and not os.path.exists("/content/SMILEs"):
+    print("SMILEs.zip klasöre çıkarılıyor...")
+    with zipfile.ZipFile(zip_yolu, 'r') as zip_ref:
+        zip_ref.extractall("/content/")
+
+# ─── HÜCRE 2 ───────────────────────────────────────
+# HÜCRE 2: Hiperparametreler ve Klasör Yolları
+POZ_YOL   = "/content/SMILEs/positives/positives7/"
+NEG_YOL   = "/content/SMILEs/negatives/negatives7/"
+
+# DİKKAT: Sol taraftaki menüden 'dosyam' klasörü oluşturup resimlerini yüklemelisin!
+KENDI_DIR = "/content/dosyam"
+
+RESIM_BOYUTU = 64
+BATCH_BOYUTU = 64
+EPOCH_SAYISI = 20
+
+CIHAZ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(42)
+np.random.seed(42)
+
+print(f"Eğitim için kullanılan donanım: {CIHAZ}")
+
+# ─── HÜCRE 3 ───────────────────────────────────────
+# HÜCRE 3: Veri Yükleme ve Pre-processing
+def veri_yukle(poz_yol, neg_yol, boyut):
+    resimler, etiketler = [], []
+    for klasor_yolu, etiket in [(poz_yol, 1), (neg_yol, 0)]:
+        if not os.path.exists(klasor_yolu): continue
+        dosyalar = os.listdir(klasor_yolu)
+        for dosya_adi in dosyalar:
+            if not dosya_adi.lower().endswith('.jpg'): continue
+            try:
+                resim = cv2.imread(os.path.join(klasor_yolu, dosya_adi), cv2.IMREAD_GRAYSCALE)
+                if resim is None: continue
+                resimler.append(cv2.resize(resim, (boyut, boyut)))
+                etiketler.append(etiket)
+            except Exception:
+                continue
+
+    X = np.array(resimler, dtype=np.float32) / 255.0
+    y = np.array(etiketler, dtype=np.float32)
+    return X, y
+
+print("Veri seti yükleniyor...")
+X, y = veri_yukle(POZ_YOL, NEG_YOL, RESIM_BOYUTU)
+print(f"Toplam: {len(X)} | Gülümseyen: {int(y.sum())} | Gülümsemeyen: {int(len(y)-y.sum())}")
+
+X_egitim, X_test, y_egitim, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# CNN için boyutlandırma: (Batch, Channel, Height, Width) -> (N, 1, 64, 64)
+X_eg_t = torch.tensor(X_egitim).unsqueeze(1)
+X_te_t = torch.tensor(X_test).unsqueeze(1)
+y_eg_t = torch.tensor(y_egitim).unsqueeze(1)
+y_te_t = torch.tensor(y_test).unsqueeze(1)
+
+eg_yuk = DataLoader(TensorDataset(X_eg_t, y_eg_t), batch_size=BATCH_BOYUTU, shuffle=True)
+te_yuk = DataLoader(TensorDataset(X_te_t, y_te_t), batch_size=BATCH_BOYUTU, shuffle=False)
+
+# ─── HÜCRE 4 ───────────────────────────────────────
+# HÜCRE 4: Dinamik CNN Mimarisi ve Eğitim Fonksiyonları
+class CNN(nn.Module):
+    def __init__(self, boyut=64, filtre=8, dropout=0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, filtre, kernel_size=3, padding=1)
+        self.relu  = nn.ReLU()
+        self.pool  = nn.MaxPool2d(2, 2)
+        self.drop  = nn.Dropout(dropout)
+        self.fc    = nn.Linear(filtre * (boyut//2) * (boyut//2), 1)
+
+    def forward(self, x):
+        x = self.drop(self.pool(self.relu(self.conv1(x))))
+        return self.fc(x.view(x.size(0), -1))
+
+def egit(model, eg_yuk, te_yuk, epoch=20, lr=0.001, opt="adam"):
+    model = model.to(CIHAZ)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    if opt == "adam": optim = torch.optim.Adam(model.parameters(), lr=lr)
+    else: optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+
+    gecmis = {k: [] for k in ["egitim_loss","test_loss","egitim_acc","test_acc"]}
+
+    for e in range(epoch):
+        model.train()
+        tl, td, tt = 0.0, 0, 0
+        for Xb, yb in eg_yuk:
+            Xb, yb = Xb.to(CIHAZ), yb.to(CIHAZ)
+            optim.zero_grad()
+            c = model(Xb)
+            l = loss_fn(c, yb)
+            l.backward(); optim.step()
+
+            tl += l.item()*Xb.size(0)
+            td += (torch.sigmoid(c)>=0.5).float().eq(yb).sum().item()
+            tt += Xb.size(0)
+        el, ea = tl/tt, td/tt
+
+        model.eval()
+        vl, vd, vt = 0.0, 0, 0
+        with torch.no_grad():
+            for Xb, yb in te_yuk:
+                Xb, yb = Xb.to(CIHAZ), yb.to(CIHAZ)
+                c = model(Xb)
+                l = loss_fn(c, yb)
+
+                vl += l.item()*Xb.size(0)
+                vd += (torch.sigmoid(c)>=0.5).float().eq(yb).sum().item()
+                vt += Xb.size(0)
+        tl2, ta = vl/vt, vd/vt
+
+        gecmis["egitim_loss"].append(el); gecmis["test_loss"].append(tl2)
+        gecmis["egitim_acc"].append(ea); gecmis["test_acc"].append(ta)
+
+    return gecmis, (el, ea, tl2, ta)
+
+def grafik(gecmis, baslik, dosya):
+    ep = range(1, len(gecmis["egitim_loss"])+1)
+    plt.figure(figsize=(10, 6))
+    plt.plot(ep, gecmis["egitim_loss"], label="Train Loss", color='red', linestyle='-')
+    plt.plot(ep, gecmis["test_loss"], label="Validation Loss", color='orange', linestyle='-')
+    plt.plot(ep, gecmis["egitim_acc"], label="Train Accuracy", color='blue', linestyle='--')
+    plt.plot(ep, gecmis["test_acc"], label="Validation Accuracy", color='cyan', linestyle='--')
+
+    plt.title(baslik)
+    plt.xlabel("Epoch"); plt.ylabel("Değer")
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    plt.savefig(dosya, dpi=150)
+    plt.show()
+
+# ─── HÜCRE 5 ───────────────────────────────────────
+# HÜCRE 5: İYİLEŞTİRME 1 - FİLTRE SAYISI (16, 32, 64)
+print("="*55)
+print("İYİLEŞTİRME 1: FİLTRE SAYISI (16, 32, 64)")
+print("="*55)
+
+filtre_sonuclari = {}  # Karşılaştırma için sonuçları saklıyoruz
+
+fig, axlar = plt.subplots(1, 2, figsize=(14, 5))
+renkler = {16: ('blue','cyan'), 32: ('red','orange'), 64: ('green','limegreen')}
+
+for f in [16, 32, 64]:
+    print(f">> Test Edilen Filtre Sayısı = {f}")
+    g, s = egit(CNN(RESIM_BOYUTU, filtre=f), eg_yuk, te_yuk, EPOCH_SAYISI)
+    filtre_sonuclari[f] = s  # Son epoch sonuçlarını sakla
+    ep = range(1, EPOCH_SAYISI+1)
+    renk_e, renk_t = renkler[f]
+    axlar[0].plot(ep, g["egitim_loss"], label=f"Filtre={f} Train",      color=renk_e, linestyle='-')
+    axlar[0].plot(ep, g["test_loss"],   label=f"Filtre={f} Val",        color=renk_t, linestyle='--')
+    axlar[1].plot(ep, g["egitim_acc"],  label=f"Filtre={f} Train Acc",  color=renk_e, linestyle='-')
+    axlar[1].plot(ep, g["test_acc"],    label=f"Filtre={f} Val Acc",    color=renk_t, linestyle='--')
+    print(f"   SONUÇ: Eğt Acc={s[1]:.4f} | Test Acc={s[3]:.4f}\n")
+
+axlar[0].set_title("İyileştirme 1 – Filtre Sayısı: Loss");  axlar[0].set_xlabel("Epoch"); axlar[0].set_ylabel("Loss")
+axlar[1].set_title("İyileştirme 1 – Filtre Sayısı: Accuracy"); axlar[1].set_xlabel("Epoch"); axlar[1].set_ylabel("Accuracy")
+for ax in axlar: ax.legend(); ax.grid(True)
+plt.tight_layout()
+plt.savefig("iyilestirme1_filtre.png", dpi=150)
+plt.show()
+print("Grafik kaydedildi: iyilestirme1_filtre.png")
+
+
+# ─── HÜCRE 6 ───────────────────────────────────────
+# HÜCRE 6: İYİLEŞTİRME 2 - ÖĞRENME ORANI (0.01, 0.001, 0.0001)
+print("="*55)
+print("İYİLEŞTİRME 2: ÖĞRENME ORANI (0.01, 0.001, 0.0001)")
+print("="*55)
+
+lr_sonuclari = {}
+
+fig, axlar = plt.subplots(1, 2, figsize=(14, 5))
+renkler_lr = {0.01: ('blue','cyan'), 0.001: ('red','orange'), 0.0001: ('green','limegreen')}
+
+for lr in [0.01, 0.001, 0.0001]:
+    print(f">> Test Edilen Learning Rate = {lr}")
+    g, s = egit(CNN(RESIM_BOYUTU, filtre=32), eg_yuk, te_yuk, EPOCH_SAYISI, lr=lr)
+    lr_sonuclari[lr] = s
+    ep = range(1, EPOCH_SAYISI+1)
+    renk_e, renk_t = renkler_lr[lr]
+    axlar[0].plot(ep, g["egitim_loss"], label=f"lr={lr} Train",     color=renk_e, linestyle='-')
+    axlar[0].plot(ep, g["test_loss"],   label=f"lr={lr} Val",       color=renk_t, linestyle='--')
+    axlar[1].plot(ep, g["egitim_acc"],  label=f"lr={lr} Train Acc", color=renk_e, linestyle='-')
+    axlar[1].plot(ep, g["test_acc"],    label=f"lr={lr} Val Acc",   color=renk_t, linestyle='--')
+    print(f"   SONUÇ: Eğt Acc={s[1]:.4f} | Test Acc={s[3]:.4f}\n")
+
+axlar[0].set_title("İyileştirme 2 – Öğrenme Oranı: Loss");    axlar[0].set_xlabel("Epoch"); axlar[0].set_ylabel("Loss")
+axlar[1].set_title("İyileştirme 2 – Öğrenme Oranı: Accuracy"); axlar[1].set_xlabel("Epoch"); axlar[1].set_ylabel("Accuracy")
+for ax in axlar: ax.legend(); ax.grid(True)
+plt.tight_layout()
+plt.savefig("iyilestirme2_lr.png", dpi=150)
+plt.show()
+print("Grafik kaydedildi: iyilestirme2_lr.png")
+
+
+# ─── HÜCRE 7 ───────────────────────────────────────
+# HÜCRE 7: İYİLEŞTİRME 3 - DROPOUT (0.0, 0.2, 0.5)
+print("="*55)
+print("İYİLEŞTİRME 3: DROPOUT (0.0, 0.2, 0.5)")
+print("="*55)
+
+dropout_sonuclari = {}
+
+fig, axlar = plt.subplots(1, 2, figsize=(14, 5))
+renkler_dr = {0.0: ('blue','cyan'), 0.2: ('red','orange'), 0.5: ('green','limegreen')}
+
+for dr in [0.0, 0.2, 0.5]:
+    print(f">> Test Edilen Dropout Oranı = {dr}")
+    g, s = egit(CNN(RESIM_BOYUTU, filtre=32, dropout=dr), eg_yuk, te_yuk, EPOCH_SAYISI)
+    dropout_sonuclari[dr] = s
+    ep = range(1, EPOCH_SAYISI+1)
+    renk_e, renk_t = renkler_dr[dr]
+    axlar[0].plot(ep, g["egitim_loss"], label=f"dropout={dr} Train",     color=renk_e, linestyle='-')
+    axlar[0].plot(ep, g["test_loss"],   label=f"dropout={dr} Val",       color=renk_t, linestyle='--')
+    axlar[1].plot(ep, g["egitim_acc"],  label=f"dropout={dr} Train Acc", color=renk_e, linestyle='-')
+    axlar[1].plot(ep, g["test_acc"],    label=f"dropout={dr} Val Acc",   color=renk_t, linestyle='--')
+    print(f"   SONUÇ: Eğt Acc={s[1]:.4f} | Test Acc={s[3]:.4f}\n")
+
+axlar[0].set_title("İyileştirme 3 – Dropout: Loss");    axlar[0].set_xlabel("Epoch"); axlar[0].set_ylabel("Loss")
+axlar[1].set_title("İyileştirme 3 – Dropout: Accuracy"); axlar[1].set_xlabel("Epoch"); axlar[1].set_ylabel("Accuracy")
+for ax in axlar: ax.legend(); ax.grid(True)
+plt.tight_layout()
+plt.savefig("iyilestirme3_dropout.png", dpi=150)
+plt.show()
+print("Grafik kaydedildi: iyilestirme3_dropout.png")
+
+
+# ─── HÜCRE 8 ───────────────────────────────────────
+# HÜCRE 8: İYİLEŞTİRME 4 - OPTİMİZASYON ALGORİTMASI (adam, sgd)
+print("="*55)
+print("İYİLEŞTİRME 4: OPTİMİZASYON (adam, sgd)")
+print("="*55)
+
+opt_sonuclari = {}
+
+fig, axlar = plt.subplots(1, 2, figsize=(14, 5))
+renkler_opt = {"adam": ('blue','cyan'), "sgd": ('red','orange')}
+
+for opt in ["adam", "sgd"]:
+    print(f">> Test Edilen Optimizer = {opt}")
+    g, s = egit(CNN(RESIM_BOYUTU, filtre=32, dropout=0.2), eg_yuk, te_yuk, EPOCH_SAYISI, opt=opt)
+    opt_sonuclari[opt] = s
+    ep = range(1, EPOCH_SAYISI+1)
+    renk_e, renk_t = renkler_opt[opt]
+    axlar[0].plot(ep, g["egitim_loss"], label=f"{opt} Train",     color=renk_e, linestyle='-')
+    axlar[0].plot(ep, g["test_loss"],   label=f"{opt} Val",       color=renk_t, linestyle='--')
+    axlar[1].plot(ep, g["egitim_acc"],  label=f"{opt} Train Acc", color=renk_e, linestyle='-')
+    axlar[1].plot(ep, g["test_acc"],    label=f"{opt} Val Acc",   color=renk_t, linestyle='--')
+    print(f"   SONUÇ: Eğt Acc={s[1]:.4f} | Test Acc={s[3]:.4f}\n")
+
+axlar[0].set_title("İyileştirme 4 – Optimizer: Loss");    axlar[0].set_xlabel("Epoch"); axlar[0].set_ylabel("Loss")
+axlar[1].set_title("İyileştirme 4 – Optimizer: Accuracy"); axlar[1].set_xlabel("Epoch"); axlar[1].set_ylabel("Accuracy")
+for ax in axlar: ax.legend(); ax.grid(True)
+plt.tight_layout()
+plt.savefig("iyilestirme4_optimizer.png", dpi=150)
+plt.show()
+print("Grafik kaydedildi: iyilestirme4_optimizer.png")
+
+
+# ─── HÜCRE 9 ───────────────────────────────────────
+# HÜCRE 9b: TÜM İYİLEŞTİRMELERİN KARŞILAŞTIRMA TABLOSU
+import matplotlib.pyplot as plt
+import numpy as np
+
+print("="*60)
+print("GENEL KARŞILAŞTIRMA TABLOSU")
+print("="*60)
+
+# Tüm sonuçları birleştir
+satirlar = []
+
+for f, s in filtre_sonuclari.items():
+    satirlar.append({"Parametre": f"Filtre={f}", "Eğt Acc": s[1], "Test Acc": s[3], "Eğt Loss": s[0], "Test Loss": s[2]})
+
+for lr, s in lr_sonuclari.items():
+    satirlar.append({"Parametre": f"lr={lr}", "Eğt Acc": s[1], "Test Acc": s[3], "Eğt Loss": s[0], "Test Loss": s[2]})
+
+for dr, s in dropout_sonuclari.items():
+    satirlar.append({"Parametre": f"dropout={dr}", "Eğt Acc": s[1], "Test Acc": s[3], "Eğt Loss": s[0], "Test Loss": s[2]})
+
+for opt, s in opt_sonuclari.items():
+    satirlar.append({"Parametre": f"opt={opt}", "Eğt Acc": s[1], "Test Acc": s[3], "Eğt Loss": s[0], "Test Loss": s[2]})
+
+# Tablo yazdır
+print(f"{'Parametre':<18} {'Eğt Acc':>10} {'Test Acc':>10} {'Eğt Loss':>10} {'Test Loss':>10}")
+print("-"*60)
+for s in satirlar:
+    print(f"{s['Parametre']:<18} {s['Eğt Acc']:>10.4f} {s['Test Acc']:>10.4f} {s['Eğt Loss']:>10.4f} {s['Test Loss']:>10.4f}")
+
+# Karşılaştırma bar grafiği
+params   = [s["Parametre"] for s in satirlar]
+test_acc = [s["Test Acc"]  for s in satirlar]
+renkler  = (["steelblue"]*3 + ["tomato"]*3 + ["mediumseagreen"]*3 + ["mediumpurple"]*2)
+
+fig, ax = plt.subplots(figsize=(14, 6))
+bars = ax.bar(params, test_acc, color=renkler, edgecolor='black', linewidth=0.8)
+
+# Değerleri çubukların üstüne yaz
+for bar, val in zip(bars, test_acc):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+            f"{val:.4f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+# Grupları etiketle
+ax.axvline(x=2.5, color='gray', linestyle=':', linewidth=1.5)
+ax.axvline(x=5.5, color='gray', linestyle=':', linewidth=1.5)
+ax.axvline(x=8.5, color='gray', linestyle=':', linewidth=1.5)
+for x, lbl in [(1, "Filtre Sayısı"), (4, "Öğrenme Oranı"), (7, "Dropout"), (9.5, "Optimizer")]:
+    ax.text(x, max(test_acc)*0.985, lbl, ha='center', fontsize=10, color='dimgray', style='italic')
+
+ax.set_ylim(min(test_acc)*0.97, min(1.0, max(test_acc)*1.02))
+ax.set_title("Tüm İyileştirmelerin Test Accuracy Karşılaştırması", fontsize=14, fontweight='bold')
+ax.set_xlabel("Parametre Konfigürasyonu")
+ax.set_ylabel("Test Accuracy")
+ax.grid(axis='y', linestyle='--', alpha=0.5)
+plt.xticks(rotation=30, ha='right')
+plt.tight_layout()
+plt.savefig("karsilastirma_genel.png", dpi=150)
+plt.show()
+print("Karşılaştırma grafiği kaydedildi: karsilastirma_genel.png")
+
+
+# ─── HÜCRE 10 ───────────────────────────────────────
+# HÜCRE 9: EN İYİ CNN MODELİNİN EĞİTİLMESİ VE KAYDEDİLMESİ
+print("="*55)
+print("EN İYİ CNN MODELİ: 32 Filtre | dropout=0.2 | lr=0.001 | Adam")
+print("="*55)
+en_iyi_cnn = CNN(RESIM_BOYUTU, filtre=32, dropout=0.2)
+g, _ = egit(en_iyi_cnn, eg_yuk, te_yuk, EPOCH_SAYISI, lr=0.001)
+
+grafik(g, "CNN En İyi Versiyon - Performans", "CNN_en_iyi_versiyon_grafik.png")
+torch.save(en_iyi_cnn.state_dict(), "cnn_en_iyi_model.pth")
+print("Model ağırlıkları başarıyla kaydedildi: cnn_en_iyi_model.pth")
+
+# ─── HÜCRE 11 ───────────────────────────────────────
+# HÜCRE 10: SORU 8 - KENDİ FOTOĞRAFLARIMLA TAHMİN (dosyam.zip ile)
+import os
+import zipfile
+import cv2
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1. ADIM: dosyam.zip dosyasını çıkarma ---
+kendi_zip = "/content/dosyam.zip"
+hedef_klasor = "/content/dosyam"
+
+if os.path.exists(kendi_zip) and not os.path.exists(hedef_klasor):
+    print("dosyam.zip dosyası bulundu, klasöre çıkarılıyor...")
+    with zipfile.ZipFile(kendi_zip, 'r') as zip_ref:
+        # Zip içeriğini direkt /content dizinine çıkarıyoruz
+        zip_ref.extractall("/content/")
+    print("Kendi fotoğrafların başarıyla çıkarıldı!\n")
+
+# --- 2. ADIM: Tahmin (Inference) İşlemi ---
+KENDI_DIR = "/content/dosyam"
+
+# DİKKAT: Görseldeki dosya isimlerine ve .jpeg uzantısına göre güncellendi
+kendi_foto = [
+    (os.path.join(KENDI_DIR, "gülümseyen.jpeg"),    "Positive"),
+    (os.path.join(KENDI_DIR, "gülümseyen1.jpeg"),   "Positive"),
+    (os.path.join(KENDI_DIR, "gülümsemeyen.jpeg"),  "Negative"),
+    (os.path.join(KENDI_DIR, "gülümsemeyen1.jpeg"), "Negative"),
+]
+
+print("="*55)
+print("SORU 8: KENDİ FOTOĞRAFLARIMLA TAHMİN")
+print("="*55)
+
+mevcut = [(y, g) for y, g in kendi_foto if os.path.exists(y)]
+
+if not mevcut:
+    print(f"\nUYARI: Çıkarma işlemi yapıldı ama resimler '{KENDI_DIR}' içinde bulunamadı!")
+    print("Lütfen dosyam.zip'in içindeki klasör yapısının doğru olduğundan emin ol.")
+else:
+    en_iyi_cnn.eval() # Modeli tahmin moduna alıyoruz
+    fig, axlar = plt.subplots(1, len(mevcut), figsize=(4*len(mevcut), 5))
+    if len(mevcut) == 1: axlar = [axlar]
+
+    for ax, (yol, gercek) in zip(axlar, mevcut):
+        bgr  = cv2.imread(yol)
+        gri  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        g64  = cv2.resize(gri, (RESIM_BOYUTU, RESIM_BOYUTU)).astype(np.float32) / 255.0
+        x    = torch.tensor(g64).unsqueeze(0).unsqueeze(0).to(CIHAZ)
+
+        with torch.no_grad():
+            olasilik = torch.sigmoid(en_iyi_cnn(x)).item()
+
+        tahmin   = "Gülümseyen :)" if olasilik >= 0.5 else "Gülümsemeyen :("
+        dogru_mu = "DOĞRU" if ((olasilik>=0.5 and gercek=="Positive") or
+                               (olasilik<0.5  and gercek=="Negative")) else "YANLIŞ"
+
+        print(f"{os.path.basename(yol)}: {tahmin} (Olasılık={olasilik:.3f}) -> Sonuç: [{dogru_mu}]")
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        ax.imshow(rgb)
+        ax.set_title(f"{os.path.basename(yol)}\n{tahmin}\n{olasilik:.3f} [{dogru_mu}]", fontsize=10)
+        ax.axis("off")
+
+    plt.suptitle("Soru 8 - Kendi Fotoğraflarımla Model Tahminleri", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("soru8_tahminler.png", dpi=150)
+    plt.show()
+    print("\nTahmin görseli kaydedildi: soru8_tahminler.png")
